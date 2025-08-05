@@ -1,0 +1,373 @@
+import pymysql
+from pymysql.cursors import DictCursor
+import time
+import socket
+import traceback
+from passlib.context import CryptContext
+import sys
+
+
+class MySQLDatabase:
+    def __init__(self, host, port, user, password, database, max_retries=3):
+        """初始化数据库连接参数"""
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+        self.connection = None
+        self.max_retries = max_retries  # 最大重试次数
+        self._check_dependencies()  # 检查依赖是否安装
+
+    def _check_dependencies(self):
+        """检查必要依赖是否安装"""
+        try:
+            import bcrypt
+        except ImportError:
+            print("⚠️ 警告: 未检测到bcrypt库，尝试自动安装...")
+            try:
+                import subprocess
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "bcrypt"]
+                )
+                print("✅ bcrypt库安装成功")
+            except Exception as e:
+                print(f"❌ 自动安装bcrypt失败: {str(e)}")
+                print("请手动执行: pip install bcrypt")
+
+    def connect(self):
+        """建立数据库连接，带重试机制"""
+        retry_count = 0
+        while retry_count < self.max_retries:
+            try:
+                # 先检查网络连接
+                self._check_network()
+
+                self.connection = pymysql.connect(
+                    host=self.host,
+                    port=self.port,
+                    user=self.user,
+                    password=self.password,
+                    database=self.database,
+                    charset='utf8mb4',
+                    cursorclass=DictCursor,
+                    connect_timeout=10,  # 连接超时时间(秒)
+                    autocommit=False  # 手动控制事务
+                )
+                print("✅ 成功连接到数据库！")
+                return True
+            except pymysql.MySQLError as e:
+                retry_count += 1
+                error_msg = self._interpret_error(e)
+                print(f"❌ 连接数据库失败 ({retry_count}/{self.max_retries}): {error_msg}")
+                print(f"错误详情: {str(e)}")
+
+                if retry_count < self.max_retries:
+                    sleep_time = min(5, retry_count * 2)  # 最多等待5秒
+                    print(f"⏳ {sleep_time}秒后重试...")
+                    time.sleep(sleep_time)
+            except Exception as e:
+                print(f"❌ 连接过程发生意外错误: {str(e)}")
+                return False
+        return False
+
+    def _check_network(self):
+        """检查网络连接是否通畅"""
+        try:
+            # 测试与数据库服务器的网络连接
+            with socket.create_connection((self.host, self.port), timeout=5):
+                return True
+        except socket.timeout:
+            raise Exception(f"网络超时: 无法在5秒内连接到 {self.host}:{self.port}")
+        except socket.gaierror:
+            raise Exception(f"域名解析失败: 无法解析主机名 '{self.host}'")
+        except socket.error as e:
+            raise Exception(f"网络连接失败: {str(e)}")
+
+    def _interpret_error(self, error):
+        """解析数据库错误，提供更友好的提示"""
+        error_code = error.args[0] if error.args else 0
+
+        error_map = {
+            1045: "用户名或密码错误，请检查认证信息",
+            1049: f"数据库 '{self.database}' 不存在",
+            2003: f"无法连接到 {self.host}:{self.port}，可能是服务未启动或端口被防火墙拦截",
+            2005: f"无法解析主机名 '{self.host}'，请检查IP地址是否正确",
+            1044: f"用户 '{self.user}' 没有访问数据库 '{self.database}' 的权限",
+            1062: "数据重复，违反唯一约束（用户名已存在）",
+            1146: "表不存在，请检查表结构",
+            2013: "连接超时，可能是数据库负载过高或网络不稳定",
+            1364: "字段没有默认值，请检查是否有未提供的必填字段",
+            1054: "未知的列名，请检查表结构是否匹配"
+        }
+
+        return error_map.get(error_code, f"数据库错误 (代码: {error_code})")
+
+    def close(self):
+        """关闭数据库连接"""
+        if self.connection:
+            try:
+                if not self.connection._closed:  # 检查连接是否已关闭
+                    self.connection.close()
+                print("🔌 数据库连接已关闭")
+            except pymysql.MySQLError as e:
+                print(f"关闭连接时发生错误: {e}")
+            finally:
+                self.connection = None
+
+    def query(self, sql, params=None):
+        """查询数据"""
+        if not self.connection:
+            print("请先建立数据库连接")
+            return None
+
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(sql, params or ())
+                result = cursor.fetchall()
+                return result
+        except pymysql.MySQLError as e:
+            error_msg = self._interpret_error(e)
+            print(f"查询数据时发生错误: {error_msg}")
+            print(f"SQL语句: {sql}")
+            print(f"参数: {params}")
+            return None
+
+    def insert(self, sql, params=None):
+        """插入数据"""
+        if not self.connection:
+            print("请先建立数据库连接")
+            return False, 0, ""
+
+        try:
+            with self.connection.cursor() as cursor:
+                affected_rows = cursor.execute(sql, params or ())
+                self.connection.commit()
+                # 获取最后插入的ID
+                last_insert_id = cursor.lastrowid
+                print(f"成功插入 {affected_rows} 条数据，ID: {last_insert_id}")
+                return True, affected_rows, last_insert_id
+        except pymysql.MySQLError as e:
+            error_msg = self._interpret_error(e)
+            print(f"插入数据时发生错误: {error_msg}")
+            print(f"SQL语句: {sql}")
+            print(f"参数: {params}")
+            self.connection.rollback()
+            return False, 0, str(e)
+        except Exception as e:
+            print(f"插入数据时发生意外错误: {str(e)}")
+            self.connection.rollback()
+            return False, 0, str(e)
+
+    def update(self, sql, params=None):
+        """更新数据"""
+        if not self.connection:
+            print("请先建立数据库连接")
+            return False
+
+        try:
+            with self.connection.cursor() as cursor:
+                affected_rows = cursor.execute(sql, params or ())
+                self.connection.commit()
+                print(f"成功更新 {affected_rows} 条数据")
+                return affected_rows > 0
+        except pymysql.MySQLError as e:
+            error_msg = self._interpret_error(e)
+            print(f"更新数据时发生错误: {error_msg}")
+            self.connection.rollback()
+            return False
+
+    def delete(self, sql, params=None):
+        """删除数据"""
+        if not self.connection:
+            print("请先建立数据库连接")
+            return False
+
+        try:
+            with self.connection.cursor() as cursor:
+                affected_rows = cursor.execute(sql, params or ())
+                self.connection.commit()
+                print(f"成功删除 {affected_rows} 条数据")
+                return affected_rows > 0
+        except pymysql.MySQLError as e:
+            error_msg = self._interpret_error(e)
+            print(f"删除数据时发生错误: {error_msg}")
+            self.connection.rollback()
+            return False
+
+    def check_username_exists(self, username):
+        """检查用户名是否已存在"""
+        if not self.connection:
+            print("请先建立数据库连接")
+            return None
+
+        try:
+            sql = "SELECT COUNT(*) as count FROM users WHERE username = %s"
+            result = self.query(sql, (username,))
+            if result and len(result) > 0:
+                return result[0]['count'] > 0
+            return False
+        except Exception as e:
+            print(f"检查用户名时发生错误: {str(e)}")
+            return None
+
+
+# 密码哈希配置（增加自动检测后端）
+try:
+    pwd_context = CryptContext(
+        schemes=["bcrypt"],
+        deprecated="auto",
+        bcrypt__ident="2b"  # 兼容不同版本的bcrypt
+    )
+except Exception as e:
+    print(f"⚠️ 初始化密码哈希上下文失败: {str(e)}")
+    print("尝试使用备用哈希方案...")
+    pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+
+
+def verify_password(plain_password, hashed_password):
+    """验证密码，增加错误处理"""
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        print(f"密码验证失败: {str(e)}")
+        return False
+
+
+def get_password_hash(password):
+    """生成密码哈希，增加错误处理"""
+    try:
+        return pwd_context.hash(password)
+    except Exception as e:
+        print(f"生成密码哈希失败: {str(e)}")
+        # 作为最后的备选方案（仅用于紧急情况，生产环境不推荐）
+        import hashlib
+        return hashlib.sha256(password.encode()).hexdigest()
+
+
+def create_user(db, username, password, role_id=2):
+    """创建新用户的封装函数，包含完整的错误处理"""
+    # 检查用户名是否已存在
+    exists = db.check_username_exists(username)
+    if exists is None:
+        return False, "检查用户名存在性失败"
+    if exists:
+        return False, f"用户名 '{username}' 已存在"
+
+    # 生成密码哈希
+    password_hash = get_password_hash(password)
+    if not password_hash:
+        return False, "生成密码哈希失败"
+
+    # 执行插入操作
+    insert_sql = """
+    INSERT INTO users (username, password_hash, role_id, created_at, updated_at)
+    VALUES (%s, %s, %s, NOW(), NOW())
+    """
+
+    success, rows, result = db.insert(insert_sql, (username, password_hash, role_id))
+    if success:
+        return True, f"用户创建成功，ID: {result}"
+    else:
+        return False, f"用户创建失败: {result}"
+
+
+def main():
+    # 数据库配置 - 请根据实际情况修改以下参数
+    db_config = {
+        "host": "62.234.187.52",  # 数据库IP地址
+        "port": 3306,  # 数据库端口
+        "user": "mytest",  # 数据库用户名
+        "password": "Test@123",  # 数据库密码
+        "database": "test",  # 数据库名称
+        "max_retries": 3  # 连接重试次数
+    }
+
+    # 打印当前Python环境信息
+    print(f"当前Python版本: {sys.version.split()[0]}")
+    print(f"当前环境路径: {sys.executable}")
+
+    # 创建数据库实例
+    db = MySQLDatabase(**db_config)
+
+    # 连接数据库
+    if not db.connect():
+        print("❌ 数据库连接失败，程序退出")
+        return
+
+    try:
+        # 1. 查看表结构（调试用）
+        print("\n--- 查看users表结构 ---")
+        table_structure = db.query("DESCRIBE users")
+        if table_structure:
+            for field in table_structure:
+                print(field)
+        else:
+            print("未查询到users表结构，可能表不存在")
+            # 尝试创建表（如果不存在）
+            create_table_sql = """
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(50) NOT NULL UNIQUE,
+                password_hash VARCHAR(255) NOT NULL,
+                role_id INT NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                last_login DATETIME NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+            # 使用query而不是insert执行CREATE TABLE
+            if db.query(create_table_sql) is not None:
+                print("已自动创建users表")
+                # 创建后再次检查表结构
+                table_structure = db.query("DESCRIBE users")
+                if table_structure:
+                    for field in table_structure:
+                        print(field)
+
+        # 2. 查询操作：获取部分用户
+        print("\n--- 查询前5名用户 ---")
+        users = db.query("""
+            SELECT id, username, role_id, created_at 
+            FROM users 
+            ORDER BY created_at DESC 
+            LIMIT 5
+        """)
+        if users:
+            for user in users:
+                print(user)
+        else:
+            print("未查询到用户数据")
+
+        # 3. 插入操作：添加新用户（使用改进的创建函数）
+        print("\n--- 插入新用户 ---")
+        username = "test_user_" + str(int(time.time()))
+        password = "user_password123"
+        success, message = create_user(db, username, password, role_id=2)
+        print(f"插入结果: {message}")
+
+        if success:
+            # 4. 验证密码
+            print("\n--- 验证密码 ---")
+            user = db.query("SELECT * FROM users WHERE username = %s", (username,))
+            if user:
+                is_valid = verify_password(password, user[0]['password_hash'])
+                print(f"密码验证结果: {'成功' if is_valid else '失败'}")
+
+        # 查看数据库版本
+        print("\n--- 数据库版本 ---")
+        version = db.query("SELECT VERSION()")
+        if version:
+            print(f"数据库版本: {version[0]['VERSION()']}")
+
+    except Exception as e:
+        print(f"程序执行出错: {str(e)}")
+        print("错误堆栈:")
+        traceback.print_exc()  # 打印详细错误堆栈
+    finally:
+        # 确保连接关闭
+        db.close()
+
+
+if __name__ == "__main__":
+    main()
